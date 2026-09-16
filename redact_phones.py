@@ -380,11 +380,37 @@ _COMPRESSION_LADDER = [
 
 def _collect_image_xrefs(doc):
     """One page number per unique image xref (an image can be reused across
-    pages; we only need to touch it once via any page that has it)."""
+    pages; we only need to touch it once via any page that has it).
+
+    Soft-mask (transparency/alpha) images are deliberately EXCLUDED here.
+    page.get_images(full=True) returns every embedded image XObject,
+    including soft masks - a soft mask is just another image entry in that
+    list, and the *only* place it's identifiable as "belongs to image X as
+    its mask" is via the `smask` field (index 1) of the image it's attached
+    to. If a soft mask's own xref gets run through the same JPEG
+    recompression path as a normal photo, it gets converted from a
+    single-channel grayscale image into a 3-channel RGB JPEG - which is no
+    longer a spec-valid /SMask. The base image that references it then
+    fails to render correctly in many viewers (shows up blank/missing), and
+    the resulting exceptions during that process also cause later
+    recompression attempts on legitimate photos to be silently skipped
+    (via the `except: continue` / `except: return None` guards below),
+    which is why the output PDF was still staying oversized. Masks are
+    small grayscale data to begin with, so leaving them untouched costs
+    us essentially nothing on file size."""
+    mask_xrefs = set()
+    for page in doc:
+        for img in page.get_images(full=True):
+            smask_xref = img[1]
+            if smask_xref:
+                mask_xrefs.add(smask_xref)
+
     xref_to_page = {}
     for page in doc:
         for img in page.get_images(full=True):
             xref = img[0]
+            if xref in mask_xrefs:
+                continue
             xref_to_page.setdefault(xref, page.number)
     return xref_to_page
 
