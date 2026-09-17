@@ -212,8 +212,22 @@ def find_label_and_number_spans(line_words):
         if best:
             dmin, dmax = best
             cmin, cmax = min(lmin, dmin), max(lmax, dmax)
-            idxs = range(cmin, cmax + 1)
-            raw_rects = [line_words[i][0] for i in idxs if i < len(line_words)]
+            # Cover the label's own words and the digit run's own words -
+            # never anything else that merely sits between them by index.
+            # A word strictly between the two spans is only pulled in if
+            # it's pure punctuation (":", ".", "-", "|", ...) with no
+            # letters or digits of its own, so a stray separator gets a
+            # tidy patch but any real content in between (an email
+            # address, a "Website:" label, ...) is left completely alone
+            # even if it happens to land close by in word order.
+            covered_idxs = set(range(lmin, lmax + 1)) | set(range(dmin, dmax + 1))
+            for i in range(cmin, cmax + 1):
+                if i in covered_idxs or i >= len(line_words):
+                    continue
+                text = line_words[i][2]
+                if text and not any(ch.isalnum() for ch in text):
+                    covered_idxs.add(i)
+            raw_rects = [line_words[i][0] for i in covered_idxs if i < len(line_words)]
             if raw_rects:
                 matches.append((_union_rect(raw_rects), "[labeled phone line]"))
             used_label_spans.add((lmin, lmax))
