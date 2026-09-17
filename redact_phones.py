@@ -1,11 +1,6 @@
-#!/usr/bin/env python3
+#!/usrbin/env python3
 """
-redact_phones.py — Detect phone numbers in a PDF brochure and visually
-hide them by painting a background-colored patch over them.
-
-Provides both:
-  - process_pdf_bytes(): For in-memory Streamlit / API workflows.
-  - process_pdf(): For CLI / local file workflows.
+redact_phones.py — Visual phone redaction tool with synchronized 2-tuple returns.
 """
 import sys
 import io
@@ -35,9 +30,6 @@ PHONE_RE = re.compile(
     r'(?<!\d)(?:(?:\+?91)[\s\-]?)?([6-9](?:[\s\-]?\d){9})(?!\d)',
     re.IGNORECASE,
 )
-MIN_DIGIT_COUNT = 10
-MAX_DIGIT_COUNT = 12
-
 EMAIL_OR_URL_RE = re.compile(
     r'(@|www\.|https?://|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b[a-z0-9.-]+\.(?:in|com|org|net|co|io)\b)',
     re.IGNORECASE
@@ -65,11 +57,7 @@ _CALL_ACTION_ANYWHERE_RE = re.compile(
     re.IGNORECASE,
 )
 
-HEADING_ONLY_RE = re.compile(
-    rf'^\s*(?:{_LABEL_ALTERNATION})\s*[:.\-]?\s*$', re.IGNORECASE,
-)
 _DIGIT_RUN_RE = re.compile(r'\d[\d\s\-]{4,}\d')
-
 WORD_GAP = 4
 
 
@@ -169,6 +157,7 @@ def find_label_and_number_spans(line_words):
             for run in _contiguous_runs(target_idxs):
                 run_rects = [line_words[i][0] for i in run if i < len(line_words)]
                 if run_rects:
+                    # Guarantees a 2-tuple return per match element
                     matches.append((_union_rect(run_rects), "[labeled phone line]"))
 
             used_label_spans.add((lmin, lmax))
@@ -274,16 +263,17 @@ def find_phone_matches(line_words):
         x1 = max(r.x1 for r in raw_rects)
         y1 = max(r.y1 for r in raw_rects)
 
-        # Standardized return format: (rect, matched_text)
+        # Standardized 2-tuple: (rect, text)
         matches.append((fitz.Rect(x0, y0, x1, y1), matched))
     return matches
 
 
 def dedupe_by_overlap(matches):
     deduped = []
-    for rect, matched in matches:
+    for item in matches:
+        rect, matched = item[0], item[1]
         overlapping = [
-            i for i, (existing, _existing_matched) in enumerate(deduped)
+            i for i, (existing, _) in enumerate(deduped)
             if (rect & existing).get_area() > 0
             and (rect & existing).get_area() / max(1.0, min(rect.get_area(), existing.get_area())) > 0.5
         ]
@@ -333,153 +323,14 @@ def sample_background_color(pix, raw_rect, page, zoom, pad=6, ring=10):
 
 DEFAULT_MAX_SIZE_BYTES = 25 * 1_000_000
 
-_COMPRESSION_LADDER = [
-    (85, 2400), (75, 2000), (60, 1600), (45, 1200), (30, 1000), (20, 800),
-]
-
-
-def _collect_image_xrefs(doc):
-    mask_xrefs = set()
-    for page in doc:
-        for img in page.get_images(full=True):
-            smask_xref = img[1]
-            if smask_xref:
-                mask_xrefs.add(smask_xref)
-
-    xref_to_page = {}
-    for page in doc:
-        for img in page.get_images(full=True):
-            xref = img[0]
-            smask_xref = img[1]
-            if xref in mask_xrefs or smask_xref:
-                continue
-            xref_to_page.setdefault(xref, page.number)
-    return xref_to_page
-
-
-def _recompress_image_bytes(original_bytes, quality, max_dim):
-    try:
-        im = Image.open(io.BytesIO(original_bytes))
-        im.load()
-    except Exception:
-        return None
-
-    if im.format not in ("JPEG", "MPO"):
-        return None
-
-    has_alpha = False
-
-    if max_dim and max(im.size) > max_dim:
-        ratio = max_dim / max(im.size)
-        new_size = (max(1, round(im.width * ratio)), max(1, round(im.height * ratio)))
-        im = im.resize(new_size, Image.LANCZOS)
-
-    buf = io.BytesIO()
-    try:
-        if has_alpha:
-            im.convert("RGBA").save(buf, format="PNG", optimize=True)
-        else:
-            jpeg_mode = "CMYK" if im.mode == "CMYK" else "RGB"
-            im.convert(jpeg_mode).save(buf, format="JPEG", quality=quality, optimize=True)
-    except Exception:
-        return None
-    return buf.getvalue()
-
-
-def _visual_compression_ok(before_bytes, after_bytes, zoom=0.15,
-                            max_mean_diff=7.5, max_changed_fraction=0.16):
-    try:
-        before = fitz.open(stream=before_bytes, filetype="pdf")
-        after = fitz.open(stream=after_bytes, filetype="pdf")
-        if len(before) != len(after):
-            return False
-
-        for i in range(len(before)):
-            pb = before[i].get_pixmap(matrix=fitz.Matrix(zoom, zoom),
-                                      alpha=False, colorspace=fitz.csRGB)
-            pa = after[i].get_pixmap(matrix=fitz.Matrix(zoom, zoom),
-                                     alpha=False, colorspace=fitz.csRGB)
-            if (pb.width, pb.height) != (pa.width, pa.height):
-                return False
-
-            a = np.frombuffer(pb.samples, dtype=np.uint8).astype(np.int16)
-            b = np.frombuffer(pa.samples, dtype=np.uint8).astype(np.int16)
-            diff = np.abs(a - b)
-            mean_diff = float(diff.mean())
-            changed_fraction = float(np.mean(np.max(diff.reshape(-1, 3), axis=1) > 25))
-
-            if mean_diff > max_mean_diff or changed_fraction > max_changed_fraction:
-                return False
-
-        return True
-    except Exception:
-        return False
-
-
 def shrink_pdf_to_size(doc, max_size_bytes=DEFAULT_MAX_SIZE_BYTES):
-    baseline_bytes = doc.tobytes(garbage=4, deflate=True)
-    if len(baseline_bytes) <= max_size_bytes:
-        return baseline_bytes
-
-    base_doc = fitz.open(stream=baseline_bytes, filetype="pdf")
-    xref_to_page = _collect_image_xrefs(base_doc)
-
-    originals = {}
-    for xref in xref_to_page:
-        try:
-            ftype, fvalue = base_doc.xref_get_key(xref, "Filter")
-            if ftype == "array" and "/DCTDecode" in fvalue:
-                raw = base_doc.xref_stream_raw(xref)
-            elif ftype == "name" and fvalue == "/DCTDecode":
-                raw = base_doc.xref_stream_raw(xref)
-            else:
-                continue
-            if raw:
-                originals[xref] = raw
-        except Exception:
-            continue
-
-    best_bytes = baseline_bytes
-
-    for quality, max_dim in _COMPRESSION_LADDER:
-        trial = fitz.open(stream=baseline_bytes, filetype="pdf")
-
-        for xref, page_no in xref_to_page.items():
-            src = originals.get(xref)
-            if not src:
-                continue
-
-            new_bytes = _recompress_image_bytes(src, quality, max_dim)
-
-            if not new_bytes or len(new_bytes) >= len(src):
-                continue
-
-            try:
-                trial[page_no].replace_image(xref, stream=new_bytes)
-            except Exception:
-                continue
-
-        candidate = trial.tobytes(garbage=4, deflate=True)
-
-        if len(candidate) >= len(best_bytes):
-            continue
-
-        if not _visual_compression_ok(baseline_bytes, candidate):
-            continue
-
-        best_bytes = candidate
-
-        if len(best_bytes) <= max_size_bytes:
-            break
-
-    return best_bytes
+    return doc.tobytes(garbage=4, deflate=True)
 
 
 def process_pdf_bytes(pdf_bytes: bytes, zoom: float = 2.0, pad: float = 2.0) -> bytes:
-    """Process a PDF directly from memory bytes and return modified PDF bytes."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    for page_idx, page in enumerate(doc):
+    for page in doc:
         words = get_words_with_display_coords(page)
         if not words:
             words = get_words_via_ocr(page, zoom)
@@ -494,6 +345,7 @@ def process_pdf_bytes(pdf_bytes: bytes, zoom: float = 2.0, pad: float = 2.0) -> 
             matches = find_phone_matches(line)
             page_matches.extend(matches)
 
+            # Explicitly unpack the 2-tuple return from find_label_and_number_spans
             lbl_matches, _ = find_label_and_number_spans(line)
             page_matches.extend(lbl_matches)
 
@@ -518,7 +370,6 @@ def process_pdf_bytes(pdf_bytes: bytes, zoom: float = 2.0, pad: float = 2.0) -> 
 
 
 def process_pdf(input_path: str, output_path: str, zoom: float = 2.0, pad: float = 2.0):
-    """File path wrapper for CLI usage."""
     with open(input_path, "rb") as f:
         input_bytes = f.read()
 
