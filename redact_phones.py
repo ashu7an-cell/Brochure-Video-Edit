@@ -1,37 +1,19 @@
 #!/usr/bin/env python3
 """
 redact_phones.py — Detect phone numbers in a PDF brochure and visually
-hide them by painting a background-colored patch over them (no destructive
-content-stream redaction, so it's a pure visual cover-up, not a
-guaranteed-unrecoverable redaction).
+hide them by painting a background-colored patch over them.
 
-Two detection paths, chosen per-page automatically:
-  1. Real text (page.get_text("words")) — fast, used when the page has an
-     actual text layer.
-  2. OCR (pytesseract on a rendered pixmap) — used when a page has NO
-     extractable text at all, which happens when a PDF is exported from a
-     design tool (Illustrator/Canva/InDesign) with fonts converted to
-     vector outlines/curves, or when a page is a scanned image. In that
-     case there are no text objects for get_text() to find, so phone
-     numbers are invisible to path 1 no matter how good the regex is.
-
-Handles pages with a /Rotate entry: detection/grouping happens in the
-page's final display orientation, while patches are drawn in the PDF's
-raw (pre-rotation) coordinate space, which is what content-drawing
-operations expect.
-
-Usage:
-    python3 redact_phones.py input.pdf output.pdf
+Provides both:
+  - process_pdf_bytes(): For in-memory Streamlit / API workflows.
+  - process_pdf(): For CLI / local file workflows.
 """
 import sys
 import io
 import re
 
 try:
-    # PyMuPDF >= 1.24.3 exposes the importable name "pymupdf".
     import pymupdf as fitz
 except ImportError:
-    # Older PyMuPDF releases only expose the legacy name "fitz".
     import fitz
 
 import numpy as np
@@ -49,22 +31,18 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
-# Indian mobile numbers are normally 10 digits beginning with 6-9.
-# Also accept +91 / 91 prefixes and common brochure separators.
 PHONE_RE = re.compile(
     r'(?<!\d)(?:(?:\+?91)[\s\-]?)?([6-9](?:[\s\-]?\d){9})(?!\d)',
     re.IGNORECASE,
 )
 MIN_DIGIT_COUNT = 10
-MAX_DIGIT_COUNT = 12  # 10-digit mobile, optionally +91/91
+MAX_DIGIT_COUNT = 12
 
-# Regex to detect emails and websites so they are never masked
 EMAIL_OR_URL_RE = re.compile(
     r'(@|www\.|https?://|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b[a-z0-9.-]+\.(?:in|com|org|net|co|io)\b)',
     re.IGNORECASE
 )
 
-# --- Landline numbers and phone-related headings ----------------------------
 PHONE_LABEL_WORDS = (
     "ph", "tel", "telephone", "phone", "mobile", "mob", "cell", "fax",
     "contact details", "contact information", "contact no", "contact number",
@@ -90,7 +68,7 @@ _CALL_ACTION_ANYWHERE_RE = re.compile(
 HEADING_ONLY_RE = re.compile(
     rf'^\s*(?:{_LABEL_ALTERNATION})\s*[:.\-]?\s*$', re.IGNORECASE,
 )
-_DIGIT_RUN_RE = re.compile(r'\d[\d\s\-]{4,}\d')  # a loose run of >=6 digits
+_DIGIT_RUN_RE = re.compile(r'\d[\d\s\-]{4,}\d')
 
 WORD_GAP = 4
 
@@ -103,7 +81,6 @@ def _union_rect(rects):
 
 
 def _contiguous_runs(idxs):
-    """Split a set of word indices into sorted contiguous runs."""
     if not idxs:
         return []
     idxs = sorted(idxs)
@@ -137,21 +114,14 @@ def _char_span_to_word_span(s, e, offsets):
 
 
 def find_label_and_number_spans(line_words):
-    """
-    Find phone labels and numbers on a line, returning rects ONLY for the label
-    words and digit words themselves to prevent overwriting adjacent content 
-    like emails or website URLs.
-    """
     concat, offsets = _line_concat_and_offsets(line_words)
 
-    # 1. Identify word indices for emails and websites to protect them
     email_url_word_idxs = set()
     for m in EMAIL_OR_URL_RE.finditer(concat):
         span = _char_span_to_word_span(m.start(), m.end(), offsets)
         if span:
             email_url_word_idxs.update(range(span[0], span[1] + 1))
 
-    # 2. Find labels
     label_spans = []
     for pattern in (_LABEL_ANYWHERE_RE, _CALL_ACTION_ANYWHERE_RE):
         for m in pattern.finditer(concat):
@@ -159,7 +129,6 @@ def find_label_and_number_spans(line_words):
             if span:
                 label_spans.append(span)
 
-    # 3. Find digit runs
     digit_spans = []
     for m in _DIGIT_RUN_RE.finditer(concat):
         if sum(ch.isdigit() for ch in m.group(0)) < 6:
@@ -171,7 +140,6 @@ def find_label_and_number_spans(line_words):
     matches = []
     used_label_spans = set()
 
-    # 4. Pair labels to digits
     for (lmin, lmax) in label_spans:
         best = None
         best_gap = None
@@ -183,7 +151,6 @@ def find_label_and_number_spans(line_words):
         if best:
             dmin, dmax = best
 
-            # Spatial distance validation
             label_rects = [line_words[i][0] for i in range(lmin, lmax + 1)]
             digit_rects = [line_words[i][0] for i in range(dmin, dmax + 1)]
             label_box = _union_rect(label_rects)
@@ -197,10 +164,8 @@ def find_label_and_number_spans(line_words):
             if gap_x > 8.0 * avg_h or gap_y > 3.0 * avg_h:
                 continue
 
-            # Mask ONLY label indices and digit indices (excluding any email/URL tokens)
             target_idxs = (set(range(lmin, lmax + 1)) | set(range(dmin, dmax + 1))) - email_url_word_idxs
 
-            # Group remaining target indices into contiguous blocks to draw individual rects
             for run in _contiguous_runs(target_idxs):
                 run_rects = [line_words[i][0] for i in run if i < len(line_words)]
                 if run_rects:
@@ -443,16 +408,10 @@ def _visual_compression_ok(before_bytes, after_bytes, zoom=0.15,
             changed_fraction = float(np.mean(np.max(diff.reshape(-1, 3), axis=1) > 25))
 
             if mean_diff > max_mean_diff or changed_fraction > max_changed_fraction:
-                print(
-                    f"Safety check rejected compression on page {i+1}: "
-                    f"mean pixel diff={mean_diff:.2f}, "
-                    f"changed pixels={changed_fraction:.1%}"
-                )
                 return False
 
         return True
-    except Exception as exc:
-        print(f"Safety check could not verify compressed PDF: {exc}")
+    except Exception:
         return False
 
 
@@ -508,30 +467,18 @@ def shrink_pdf_to_size(doc, max_size_bytes=DEFAULT_MAX_SIZE_BYTES):
             continue
 
         best_bytes = candidate
-        print(
-            f"Accepted safe compression: quality={quality}, "
-            f"max_dim={max_dim}, size={len(best_bytes)/1_000_000:.2f} MB"
-        )
 
         if len(best_bytes) <= max_size_bytes:
             break
 
-    if len(best_bytes) > max_size_bytes:
-        print(
-            f"WARNING: Could not safely compress to "
-            f"{max_size_bytes/1_000_000:.0f} MB without risking content loss. "
-            f"Returning the last verified intact PDF at "
-            f"{len(best_bytes)/1_000_000:.2f} MB."
-        )
-
     return best_bytes
 
 
-def process_pdf(input_path, output_path, zoom=2.0, pad=2.0):
-    doc = fitz.open(input_path)
+def process_pdf_bytes(pdf_bytes: bytes, zoom: float = 2.0, pad: float = 2.0) -> bytes:
+    """Process a PDF directly from memory bytes and return modified PDF bytes."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     for page_idx, page in enumerate(doc):
-        # 1. Gather text or OCR words
         words = get_words_with_display_coords(page)
         if not words:
             words = get_words_via_ocr(page, zoom)
@@ -542,7 +489,6 @@ def process_pdf(input_path, output_path, zoom=2.0, pad=2.0):
         lines = group_lines(words)
         page_matches = []
 
-        # 2. Extract phone matches and labeled phone spans per line
         for line in lines:
             matches = find_phone_matches(line)
             for rect, matched, _ in matches:
@@ -557,7 +503,6 @@ def process_pdf(input_path, output_path, zoom=2.0, pad=2.0):
 
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
 
-        # 3. Apply background patch redactions
         for rect, _ in deduped:
             color = sample_background_color(pix, rect, page, zoom)
             padded_rect = fitz.Rect(
@@ -569,9 +514,18 @@ def process_pdf(input_path, output_path, zoom=2.0, pad=2.0):
             shape.finish(fill=color, color=None)
             shape.commit()
 
-    out_bytes = shrink_pdf_to_size(doc)
+    return shrink_pdf_to_size(doc)
+
+
+def process_pdf(input_path: str, output_path: str, zoom: float = 2.0, pad: float = 2.0):
+    """File path wrapper for CLI usage."""
+    with open(input_path, "rb") as f:
+        input_bytes = f.read()
+
+    output_bytes = process_pdf_bytes(input_bytes, zoom=zoom, pad=pad)
+
     with open(output_path, "wb") as f:
-        f.write(out_bytes)
+        f.write(output_bytes)
 
 
 if __name__ == "__main__":
