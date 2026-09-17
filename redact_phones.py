@@ -274,7 +274,8 @@ def find_phone_matches(line_words):
         x1 = max(r.x1 for r in raw_rects)
         y1 = max(r.y1 for r in raw_rects)
 
-        matches.append((fitz.Rect(x0, y0, x1, y1), matched, (word_idxs[0], word_idxs[-1])))
+        # Standardized return format: (rect, matched_text)
+        matches.append((fitz.Rect(x0, y0, x1, y1), matched))
     return matches
 
 
@@ -491,8 +492,7 @@ def process_pdf_bytes(pdf_bytes: bytes, zoom: float = 2.0, pad: float = 2.0) -> 
 
         for line in lines:
             matches = find_phone_matches(line)
-            for rect, matched, _ in matches:
-                page_matches.append((rect, matched))
+            page_matches.extend(matches)
 
             lbl_matches, _ = find_label_and_number_spans(line)
             page_matches.extend(lbl_matches)
