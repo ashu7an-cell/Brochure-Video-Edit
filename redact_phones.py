@@ -70,21 +70,22 @@ MAX_DIGIT_COUNT = 12  # 10-digit mobile, optionally +91/91
 # "Tel: 0471 2436173, 2436175, 2436401") don't fit the fixed-width mobile
 # pattern above, and their formats vary too much (STD code length, how many
 # numbers are listed, whether the STD code repeats) to regex reliably in
-# isolation. Landline numbers also almost always appear right after a
-# recognizable label ("Tel", "Ph", "Phone", "Mobile", "Contact Details", ...),
-# so instead of trying to parse each number out individually, we detect the
-# whole line as phone-related and cover it end to end - label and numbers
-# together. That also naturally satisfies removing standalone headings like a
-# lone "Ph:" line that sits above the actual number line.
+# isolation. Landline numbers also almost always appear near a recognizable
+# label ("Tel", "Ph", "Phone", "Mobile", "Contact Details", "Call for
+# Enquiry", ...), so instead of trying to parse each number out
+# individually, we look for a label ANYWHERE on a line and, if a run of
+# digits sits close to it (see WORD_GAP below), redact the label and the
+# digits together - covering the whole phone entry (label included) while
+# leaving unrelated content elsewhere on the same line (an email address, a
+# website, another column) untouched.
 PHONE_LABEL_WORDS = (
     "ph", "tel", "telephone", "phone", "mobile", "mob", "cell", "fax",
     "contact details", "contact information", "contact no", "contact number",
     # Real-estate brochures often use a call-to-action banner instead of (or
     # alongside) a plain label - e.g. a "Call for Booking :" row with the
-    # number(s) right after it. Without these, that row's heading survives
-    # even after the number next to it is redacted, which is exactly the
-    # "orphaned heading" look this list is meant to prevent.
+    # number(s) right after it, or a plain "Call For Enquiry:" banner.
     "call for booking", "call for bookings", "call now", "call us",
+    "call for enquiry", "call for enquiries",
     "for booking", "for bookings", "book now",
     "booking enquiry", "booking enquiries", "for enquiry", "for enquiries",
     "call for details", "call for site visit", "for site visit",
@@ -92,29 +93,38 @@ PHONE_LABEL_WORDS = (
 _LABEL_ALTERNATION = '|'.join(
     re.escape(w) for w in sorted(PHONE_LABEL_WORDS, key=len, reverse=True)
 )
-# A line that is *just* one of the labels (e.g. a standalone "Ph:" heading
-# with the real numbers elsewhere) - only redacted if the page also has an
-# actual phone-number match somewhere on it.
-HEADING_ONLY_RE = re.compile(
-    rf'^\s*(?:{_LABEL_ALTERNATION})\s*[:.\-]?\s*$', re.IGNORECASE,
+# Matches a phone-related label ANYWHERE within a line's text (not just as
+# a prefix), so a label sharing a physical line with other content (e.g. an
+# "Email: ... | Website: ... Tel. ..." row) is still found.
+_LABEL_ANYWHERE_RE = re.compile(
+    rf'\b(?:{_LABEL_ALTERNATION})\b[:.\-]?', re.IGNORECASE,
 )
 # Looser fallback for call-to-action headings phrased in ways the fixed list
 # above doesn't cover verbatim (e.g. "Call Us For Booking Now", "Call For
 # Booking / Site Visit"). Still anchored on "call" plus "book"/"enquir" so
-# it can't casually match an unrelated heading, and - like HEADING_ONLY_RE -
-# is only ever used to strip a line, contingent on the page already having
-# an actual phone-number match somewhere on it.
-_CALL_ACTION_RE = re.compile(
-    r'^\s*call\b[\w\s/&,]{0,30}\b(?:book(?:ing)?s?|enquir(?:y|ies))\b\s*[:.\-]?\s*$',
+# it can't casually match an unrelated heading. Searched anywhere in the
+# line, same as _LABEL_ANYWHERE_RE above.
+_CALL_ACTION_ANYWHERE_RE = re.compile(
+    r'\bcall\b[\w\s/&,]{0,30}\b(?:book(?:ing)?s?|enquir(?:y|ies))\b\s*[:.\-]?',
     re.IGNORECASE,
 )
-# A line that starts with a label and is followed by what looks like one or
-# more phone numbers (digits, spaces, +, commas, hyphens - no other words).
-_LABEL_PREFIX_RE = re.compile(
-    rf'^\s*(?:{_LABEL_ALTERNATION})\s*[:.\-]?\s*', re.IGNORECASE,
+# A standalone heading with nothing else on the line at all (e.g. a lone
+# "Ph:" or "Contact Details" line, with the real number elsewhere) - only
+# redacted if the page also has an actual phone-number match somewhere on
+# it, so a heading word with no associated number anywhere is left alone.
+HEADING_ONLY_RE = re.compile(
+    rf'^\s*(?:{_LABEL_ALTERNATION})\s*[:.\-]?\s*$', re.IGNORECASE,
 )
-_DIGITS_AND_SEPARATORS_RE = re.compile(r'^[\d\s,+\-/]+$')
 _DIGIT_RUN_RE = re.compile(r'\d[\d\s\-]{4,}\d')  # a loose run of >=6 digits
+
+# Maximum word-index distance allowed between a label (e.g. "Tel", "Call
+# For Enquiry") and a nearby digit run for them to be treated as one phone
+# entry and redacted together. Keeping this small is what stops the
+# redaction from bleeding into unrelated content that happens to share the
+# same physical line (an email address or website sitting a few words
+# before a "Tel." entry, for example) - only the label and the number get
+# covered, never the words in between other, farther-away content.
+WORD_GAP = 4
 
 
 def _union_rect(rects):
@@ -124,29 +134,92 @@ def _union_rect(rects):
     )
 
 
-def find_label_or_heading_match(line_words):
-    """Check one OCR/text line for a phone label/heading.
+def _line_concat_and_offsets(line_words):
+    """Build a searchable concatenation of a line's words plus, for each
+    word, its (start, end, word_index) character-offset triple. Shared
+    bookkeeping used by every regex-over-a-line helper below, so a
+    string-level regex match can be translated back into the word
+    index(es) it covers."""
+    concat = ""
+    offsets = []
+    for i, (raw, disp, text) in enumerate(line_words):
+        start = len(concat)
+        concat += text
+        offsets.append((start, len(concat), i))
+        concat += " "
+    return concat, offsets
 
-    Returns (raw_rect, is_heading_only) covering the WHOLE line if it is
-    either a bare label/heading (e.g. "Ph:") or a label followed by one or
-    more numbers (e.g. "Tel: 0471 2436173, 2436175, 2436401"), else None.
+
+def _char_span_to_word_span(s, e, offsets):
+    """Translate a (start, end) character range in the line's concatenated
+    text back into an inclusive (min_word_idx, max_word_idx) span."""
+    word_idxs = [wi for (ws, we, wi) in offsets if ws < e and we > s]
+    if not word_idxs:
+        return None
+    return (min(word_idxs), max(word_idxs))
+
+
+def find_label_and_number_spans(line_words):
+    """Find phone-related labels/headings anywhere in a line and, for each
+    one, look for a nearby run of digits (a landline number, or a labeled
+    mobile number) within WORD_GAP words. Only the label's words plus the
+    adjacent digit-run's words are covered - never the rest of the line -
+    so a label sharing a physical line with unrelated content (an email
+    address, a website, another column) is not swept in.
+
+    Returns:
+      matches: list of (rect, description) for every label+number pair
+        found on this line.
+      orphan_label_spans: list of (min_idx, max_idx) word spans for labels
+        that had NO nearby digit run on this line at all (candidate
+        standalone headings, e.g. a lone "Ph:" whose number sits on a
+        different line/position). The caller only redacts these if the
+        page turns out to have an actual phone match somewhere else.
     """
-    if not line_words:
-        return None
-    concat = " ".join(text for (_raw, _disp, text) in line_words).strip()
-    if not concat:
-        return None
+    concat, offsets = _line_concat_and_offsets(line_words)
 
-    if HEADING_ONLY_RE.match(concat) or _CALL_ACTION_RE.match(concat):
-        return (_union_rect([raw for (raw, _disp, _text) in line_words]), True)
+    label_spans = []
+    for pattern in (_LABEL_ANYWHERE_RE, _CALL_ACTION_ANYWHERE_RE):
+        for m in pattern.finditer(concat):
+            span = _char_span_to_word_span(m.start(), m.end(), offsets)
+            if span:
+                label_spans.append(span)
 
-    m = _LABEL_PREFIX_RE.match(concat)
-    if m:
-        remainder = concat[m.end():].strip()
-        if remainder and _DIGITS_AND_SEPARATORS_RE.match(remainder) and _DIGIT_RUN_RE.search(remainder):
-            return (_union_rect([raw for (raw, _disp, _text) in line_words]), False)
+    digit_spans = []
+    for m in _DIGIT_RUN_RE.finditer(concat):
+        if sum(ch.isdigit() for ch in m.group(0)) < 6:
+            continue
+        span = _char_span_to_word_span(m.start(), m.end(), offsets)
+        if span:
+            digit_spans.append(span)
 
-    return None
+    matches = []
+    used_label_spans = set()
+    for (lmin, lmax) in label_spans:
+        # Find the nearest digit run within WORD_GAP words of this label.
+        best = None
+        best_gap = None
+        for (dmin, dmax) in digit_spans:
+            if dmax < lmin:
+                gap = lmin - dmax
+            elif dmin > lmax:
+                gap = dmin - lmax
+            else:
+                gap = 0  # overlapping
+            if gap <= WORD_GAP and (best_gap is None or gap < best_gap):
+                best, best_gap = (dmin, dmax), gap
+
+        if best:
+            dmin, dmax = best
+            cmin, cmax = min(lmin, dmin), max(lmax, dmax)
+            idxs = range(cmin, cmax + 1)
+            raw_rects = [line_words[i][0] for i in idxs if i < len(line_words)]
+            if raw_rects:
+                matches.append((_union_rect(raw_rects), "[labeled phone line]"))
+            used_label_spans.add((lmin, lmax))
+
+    orphan_label_spans = [s for s in label_spans if s not in used_label_spans]
+    return matches, orphan_label_spans
 
 
 def get_words_with_display_coords(page):
@@ -235,15 +308,13 @@ def find_phone_matches(line_words):
     more than 1.5x the character height. Brochure layouts can have much larger
     visual spacing, so we now use the text sequence as the primary signal and
     only reject obviously distant boxes.
+
+    Returns a list of (rect, matched_text, word_span), where word_span is
+    the inclusive (min_idx, max_idx) range of words the match covers - used
+    by the caller to check whether a phone-related label sits nearby on the
+    same line.
     """
-    concat = ""
-    offsets = []
-    for i, (raw, disp, text) in enumerate(line_words):
-        # Keep a separator so digits in adjacent OCR words remain separate.
-        start = len(concat)
-        concat += text
-        offsets.append((start, len(concat), i))
-        concat += " "
+    concat, offsets = _line_concat_and_offsets(line_words)
 
     matches = []
     for m in PHONE_RE.finditer(concat):
@@ -253,14 +324,13 @@ def find_phone_matches(line_words):
         if digit_count not in (10, 12):
             continue
 
-        s, e = m.start(), m.end()
-        word_idxs = [wi for (ws, we, wi) in offsets if ws < e and we > s]
-        if not word_idxs:
+        span = _char_span_to_word_span(m.start(), m.end(), offsets)
+        if span is None:
             continue
+        word_idxs = sorted(range(span[0], span[1] + 1))
 
         # Do not require a tiny OCR gap. Only reject candidates where the
         # boxes are clearly separated into unrelated brochure regions.
-        word_idxs = sorted(word_idxs)
         rects = [line_words[wi][1] for wi in word_idxs]
         heights = [r.height for r in rects if r.height > 0]
         avg_height = sum(heights) / len(heights) if heights else 10
@@ -284,9 +354,7 @@ def find_phone_matches(line_words):
         x1 = max(r.x1 for r in raw_rects)
         y1 = max(r.y1 for r in raw_rects)
 
-        # Slightly enlarge the detection box because OCR boxes can clip
-        # ascenders/descenders or the first/last digit.
-        matches.append((fitz.Rect(x0, y0, x1, y1), matched))
+        matches.append((fitz.Rect(x0, y0, x1, y1), matched, (word_idxs[0], word_idxs[-1])))
     return matches
 
 
@@ -296,10 +364,10 @@ def dedupe_by_overlap(matches):
     real text layer and again via OCR, or a labeled-line box that fully
     contains one or more smaller mobile-regex matches on that same line).
 
-    When several matches overlap, the LARGEST box wins - a labeled line
-    like "Call for Booking : 9876543210, 9876543211" should redact the
-    whole line (label and BOTH numbers), not just whichever smaller
-    number-only match happened to be recorded first."""
+    When several matches overlap, the LARGEST box wins - a labeled entry
+    like "Call For Enquiry: 9876543210" should redact the whole entry
+    (label and number), not just whichever smaller number-only match
+    happened to be recorded first."""
     deduped = []
     for rect, matched in matches:
         overlapping = [
@@ -612,15 +680,27 @@ def _redact_document(doc, pad=4.0, zoom=2):
         heading_candidates = [] # (rect, description) - bare "Ph:"-style headings
 
         for lw in group_lines(text_words) + group_lines(ocr_words):
-            page_matches.extend(find_phone_matches(lw))
+            # Mobile numbers, wherever they sit on the line.
+            for rect, matched_text, _span in find_phone_matches(lw):
+                page_matches.append((rect, matched_text))
 
-            label_result = find_label_or_heading_match(lw)
-            if label_result:
-                rect, is_heading_only = label_result
-                if is_heading_only:
-                    heading_candidates.append((rect, "[phone heading]"))
-                else:
-                    page_matches.append((rect, "[labeled phone line]"))
+            # Any phone-related label (Tel, Contact Details, Call For
+            # Enquiry, ...) paired with a nearby digit run on the SAME
+            # line - covers the label AND the number together, and nothing
+            # else on that line (so an email/website sharing the row is
+            # left untouched).
+            label_number_matches, orphan_label_spans = find_label_and_number_spans(lw)
+            page_matches.extend(label_number_matches)
+
+            # A label with no nearby number on this line (e.g. a standalone
+            # "Ph:" or "Contact Details" heading, with the real number
+            # elsewhere) is only stripped if the page turns out to have an
+            # actual phone match somewhere else.
+            for (lmin, lmax) in orphan_label_spans:
+                idxs = range(lmin, lmax + 1)
+                raw_rects = [lw[i][0] for i in idxs if i < len(lw)]
+                if raw_rects:
+                    heading_candidates.append((_union_rect(raw_rects), "[phone heading]"))
 
         # OCR + text can detect the same phone/heading line twice, and a
         # labeled-line box can fully contain a smaller mobile-regex match on
