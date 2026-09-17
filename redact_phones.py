@@ -134,6 +134,25 @@ def _union_rect(rects):
     )
 
 
+def _contiguous_runs(idxs):
+    """Split a set of word indices into sorted contiguous runs, e.g.
+    {2,3,4,9,10} -> [[2,3,4],[9,10]]. Used so a label+number pairing patches
+    each physically-contiguous chunk of words with its own tight rectangle,
+    instead of one bounding box stretching from the label all the way to
+    the number - which would also cover any unrelated content (an email
+    address, another column) that happens to sit visually between them."""
+    idxs = sorted(idxs)
+    runs, run = [], [idxs[0]]
+    for i in idxs[1:]:
+        if i == run[-1] + 1:
+            run.append(i)
+        else:
+            runs.append(run)
+            run = [i]
+    runs.append(run)
+    return runs
+
+
 def _line_concat_and_offsets(line_words):
     """Build a searchable concatenation of a line's words plus, for each
     word, its (start, end, word_index) character-offset triple. Shared
@@ -211,6 +230,28 @@ def find_label_and_number_spans(line_words):
 
         if best:
             dmin, dmax = best
+
+            # Geometric gate: a small word-index gap isn't reliable on its
+            # own, since OCR (or a vector-outline/Illustrator-exported page)
+            # can merge visually separate rows into one logical "line". A
+            # label and a distant number can then be only a few word-indices
+            # apart even though they sit far apart on the page. Require them
+            # to also be physically close, or don't pair them - otherwise an
+            # unrelated number (e.g. a PIN code) can pull in a label from
+            # several rows away and the single resulting rectangle would
+            # bridge over real content (an email address, another column)
+            # sitting between them.
+            label_rects = [line_words[i][0] for i in range(lmin, lmax + 1)]
+            digit_rects = [line_words[i][0] for i in range(dmin, dmax + 1)]
+            label_box = _union_rect(label_rects)
+            digit_box = _union_rect(digit_rects)
+            heights = [r.height for r in label_rects + digit_rects if r.height > 0]
+            avg_h = sum(heights) / len(heights) if heights else 10
+            gap_x = max(0, max(label_box.x0, digit_box.x0) - min(label_box.x1, digit_box.x1))
+            gap_y = max(0, max(label_box.y0, digit_box.y0) - min(label_box.y1, digit_box.y1))
+            if gap_x > 8.0 * avg_h or gap_y > 3.0 * avg_h:
+                continue  # too far apart physically - don't pair
+
             cmin, cmax = min(lmin, dmin), max(lmax, dmax)
             # Cover the label's own words and the digit run's own words -
             # never anything else that merely sits between them by index.
@@ -227,9 +268,16 @@ def find_label_and_number_spans(line_words):
                 text = line_words[i][2]
                 if text and not any(ch.isalnum() for ch in text):
                     covered_idxs.add(i)
-            raw_rects = [line_words[i][0] for i in covered_idxs if i < len(line_words)]
-            if raw_rects:
-                matches.append((_union_rect(raw_rects), "[labeled phone line]"))
+
+            # Patch each physically-contiguous run of covered words with its
+            # own tight rectangle, rather than one bounding box spanning
+            # from the label all the way to the number - a single box would
+            # also sweep in any unrelated content sitting visually between
+            # them (this was the bug that patched over the email address).
+            for run in _contiguous_runs(covered_idxs):
+                run_rects = [line_words[i][0] for i in run if i < len(line_words)]
+                if run_rects:
+                    matches.append((_union_rect(run_rects), "[labeled phone line]"))
             used_label_spans.add((lmin, lmax))
 
     orphan_label_spans = [s for s in label_spans if s not in used_label_spans]
