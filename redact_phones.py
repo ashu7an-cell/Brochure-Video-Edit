@@ -26,25 +26,21 @@ Usage:
 import sys
 import io
 import re
+
 try:
     # PyMuPDF >= 1.24.3 exposes the importable name "pymupdf".
     import pymupdf as fitz
 except ImportError:
     # Older PyMuPDF releases only expose the legacy name "fitz".
     import fitz
+
 import numpy as np
 from PIL import Image
 
 try:
     import os as _os
-
     import pytesseract
 
-    # On Streamlit Cloud (Linux), tesseract is installed via packages.txt
-    # ("tesseract-ocr") and lands on PATH as `tesseract`, so pytesseract's
-    # default lookup works with no configuration needed. Only override the
-    # binary path if TESSERACT_CMD is explicitly set (e.g. for local Windows
-    # dev), so this same file works unmodified in both environments.
     _tesseract_cmd = _os.environ.get("TESSERACT_CMD")
     if _tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
@@ -55,8 +51,6 @@ except ImportError:
 
 # Indian mobile numbers are normally 10 digits beginning with 6-9.
 # Also accept +91 / 91 prefixes and common brochure separators.
-# Matching is intentionally performed on OCR/text lines rather than requiring
-# the phone number to be a single PDF/OCR word.
 PHONE_RE = re.compile(
     r'(?<!\d)(?:(?:\+?91)[\s\-]?)?([6-9](?:[\s\-]?\d){9})(?!\d)',
     re.IGNORECASE,
@@ -110,6 +104,8 @@ def _union_rect(rects):
 
 def _contiguous_runs(idxs):
     """Split a set of word indices into sorted contiguous runs."""
+    if not idxs:
+        return []
     idxs = sorted(idxs)
     runs, run = [], [idxs[0]]
     for i in idxs[1:]:
@@ -130,7 +126,7 @@ def _line_concat_and_offsets(line_words):
         concat += text
         offsets.append((start, len(concat), i))
         concat += " "
-        return concat, offsets
+    return concat, offsets
 
 
 def _char_span_to_word_span(s, e, offsets):
@@ -141,17 +137,21 @@ def _char_span_to_word_span(s, e, offsets):
 
 
 def find_label_and_number_spans(line_words):
-    """Find phone-related labels/headings anywhere in a line and mask only label
-    and digits, skipping any detected email addresses or URLs."""
+    """
+    Find phone labels and numbers on a line, returning rects ONLY for the label
+    words and digit words themselves to prevent overwriting adjacent content 
+    like emails or website URLs.
+    """
     concat, offsets = _line_concat_and_offsets(line_words)
 
-    # Identify any word indices that belong to emails or websites
+    # 1. Identify word indices for emails and websites to protect them
     email_url_word_idxs = set()
     for m in EMAIL_OR_URL_RE.finditer(concat):
         span = _char_span_to_word_span(m.start(), m.end(), offsets)
         if span:
             email_url_word_idxs.update(range(span[0], span[1] + 1))
 
+    # 2. Find labels
     label_spans = []
     for pattern in (_LABEL_ANYWHERE_RE, _CALL_ACTION_ANYWHERE_RE):
         for m in pattern.finditer(concat):
@@ -159,6 +159,7 @@ def find_label_and_number_spans(line_words):
             if span:
                 label_spans.append(span)
 
+    # 3. Find digit runs
     digit_spans = []
     for m in _DIGIT_RUN_RE.finditer(concat):
         if sum(ch.isdigit() for ch in m.group(0)) < 6:
@@ -169,50 +170,42 @@ def find_label_and_number_spans(line_words):
 
     matches = []
     used_label_spans = set()
+
+    # 4. Pair labels to digits
     for (lmin, lmax) in label_spans:
         best = None
         best_gap = None
         for (dmin, dmax) in digit_spans:
-            if dmax < lmin:
-                gap = lmin - dmax
-            elif dmin > lmax:
-                gap = dmin - lmax
-            else:
-                gap = 0
+            gap = dmin - lmax - 1 if dmin > lmax else (lmin - dmax - 1 if lmin > dmax else 0)
             if gap <= WORD_GAP and (best_gap is None or gap < best_gap):
                 best, best_gap = (dmin, dmax), gap
 
         if best:
             dmin, dmax = best
 
+            # Spatial distance validation
             label_rects = [line_words[i][0] for i in range(lmin, lmax + 1)]
             digit_rects = [line_words[i][0] for i in range(dmin, dmax + 1)]
             label_box = _union_rect(label_rects)
             digit_box = _union_rect(digit_rects)
             heights = [r.height for r in label_rects + digit_rects if r.height > 0]
             avg_h = sum(heights) / len(heights) if heights else 10
+
             gap_x = max(0, max(label_box.x0, digit_box.x0) - min(label_box.x1, digit_box.x1))
             gap_y = max(0, max(label_box.y0, digit_box.y0) - min(label_box.y1, digit_box.y1))
+
             if gap_x > 8.0 * avg_h or gap_y > 3.0 * avg_h:
                 continue
 
-            cmin, cmax = min(lmin, dmin), max(lmax, dmax)
-            covered_idxs = set(range(lmin, lmax + 1)) | set(range(dmin, dmax + 1))
-            
-            # Remove any indices that are part of an email or URL
-            covered_idxs -= email_url_word_idxs
+            # Mask ONLY label indices and digit indices (excluding any email/URL tokens)
+            target_idxs = (set(range(lmin, lmax + 1)) | set(range(dmin, dmax + 1))) - email_url_word_idxs
 
-            for i in range(cmin, cmax + 1):
-                if i in covered_idxs or i >= len(line_words) or i in email_url_word_idxs:
-                    continue
-                text = line_words[i][2]
-                if text and not any(ch.isalnum() for ch in text):
-                    covered_idxs.add(i)
-
-            for run in _contiguous_runs(covered_idxs):
+            # Group remaining target indices into contiguous blocks to draw individual rects
+            for run in _contiguous_runs(target_idxs):
                 run_rects = [line_words[i][0] for i in run if i < len(line_words)]
                 if run_rects:
                     matches.append((_union_rect(run_rects), "[labeled phone line]"))
+
             used_label_spans.add((lmin, lmax))
 
     orphan_label_spans = [s for s in label_spans if s not in used_label_spans]
@@ -532,3 +525,57 @@ def shrink_pdf_to_size(doc, max_size_bytes=DEFAULT_MAX_SIZE_BYTES):
         )
 
     return best_bytes
+
+
+def process_pdf(input_path, output_path, zoom=2.0, pad=2.0):
+    doc = fitz.open(input_path)
+
+    for page_idx, page in enumerate(doc):
+        # 1. Gather text or OCR words
+        words = get_words_with_display_coords(page)
+        if not words:
+            words = get_words_via_ocr(page, zoom)
+
+        if not words:
+            continue
+
+        lines = group_lines(words)
+        page_matches = []
+
+        # 2. Extract phone matches and labeled phone spans per line
+        for line in lines:
+            matches = find_phone_matches(line)
+            for rect, matched, _ in matches:
+                page_matches.append((rect, matched))
+
+            lbl_matches, _ = find_label_and_number_spans(line)
+            page_matches.extend(lbl_matches)
+
+        deduped = dedupe_by_overlap(page_matches)
+        if not deduped:
+            continue
+
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+
+        # 3. Apply background patch redactions
+        for rect, _ in deduped:
+            color = sample_background_color(pix, rect, page, zoom)
+            padded_rect = fitz.Rect(
+                rect.x0 - pad, rect.y0 - pad,
+                rect.x1 + pad, rect.y1 + pad
+            )
+            shape = page.new_shape()
+            shape.draw_rect(padded_rect)
+            shape.finish(fill=color, color=None)
+            shape.commit()
+
+    out_bytes = shrink_pdf_to_size(doc)
+    with open(output_path, "wb") as f:
+        f.write(out_bytes)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python3 redact_phones.py input.pdf output.pdf")
+        sys.exit(1)
+    process_pdf(sys.argv[1], sys.argv[2])
