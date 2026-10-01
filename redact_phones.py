@@ -20,6 +20,18 @@ page's final display orientation, while patches are drawn in the PDF's
 raw (pre-rotation) coordinate space, which is what content-drawing
 operations expect.
 
+CHANGELOG (fix for "only the first phone number is removed"):
+  * find_label_and_number_spans() used to pick ONE digit run next to a
+    label ("best"), so for "Tel: 0471 2436173, 2436175, 2436401" only the
+    first number was covered; the other two are not 10-digit mobile
+    numbers, so the strict mobile regex never caught them either. It now
+    follows the whole list: every further digit run that is chained to the
+    first one by nothing but separators (",", "/", "&", "|", "and", "or",
+    ...) is covered too.
+  * New continuation pass (extend_to_following_number_lines): numbers
+    stacked vertically under a label/number, one per line, are covered
+    too.
+
 Usage:
     python3 redact_phones.py input.pdf output.pdf
 """
@@ -117,6 +129,17 @@ HEADING_ONLY_RE = re.compile(
 )
 _DIGIT_RUN_RE = re.compile(r'\d[\d\s\-]{4,}\d')  # a loose run of >=6 digits
 
+# Words that may legitimately sit BETWEEN two numbers of a list
+# ("2436173, 2436175 & 2436401", "98250 12345 / 97123 45678",
+# "...or...") besides pure punctuation. Used to chain several numbers that
+# follow one label.
+_LIST_CONNECTORS = {"and", "or", "&", "/", "|", "to", "&amp;"}
+
+# A line made up ONLY of a phone-looking digit run (digits, spaces, hyphens,
+# "+", parentheses, slashes, trailing comma/semicolon). Used to catch numbers
+# stacked one-per-line under a label or under another phone number.
+_DIGIT_ONLY_LINE_RE = re.compile(r'^[\s\d\-+()/.,;|&]+$')
+
 # Maximum word-index distance allowed between a label (e.g. "Tel", "Call
 # For Enquiry") and a nearby digit run for them to be treated as one phone
 # entry and redacted together. Keeping this small is what stops the
@@ -178,13 +201,36 @@ def _char_span_to_word_span(s, e, offsets):
     return (min(word_idxs), max(word_idxs))
 
 
+def _is_list_connector(text):
+    """True for a word that may sit between two numbers of one phone list:
+    pure punctuation (",", "/", "|", "-", ...) or a connector word such as
+    "&", "and", "or"."""
+    t = text.strip()
+    if not t:
+        return True
+    if not any(ch.isalnum() for ch in t):
+        return True
+    return t.lower().strip(".,;:") in _LIST_CONNECTORS
+
+
+def _boxes_close(box_a, box_b, avg_h):
+    """Physical-proximity gate shared by label<->number pairing and
+    number<->number chaining (see the long comment in
+    find_label_and_number_spans for why word-index distance alone is not
+    trustworthy)."""
+    gap_x = max(0, max(box_a.x0, box_b.x0) - min(box_a.x1, box_b.x1))
+    gap_y = max(0, max(box_a.y0, box_b.y0) - min(box_a.y1, box_b.y1))
+    return gap_x <= 8.0 * avg_h and gap_y <= 3.0 * avg_h
+
+
 def find_label_and_number_spans(line_words):
     """Find phone-related labels/headings anywhere in a line and, for each
     one, look for a nearby run of digits (a landline number, or a labeled
-    mobile number) within WORD_GAP words. Only the label's words plus the
-    adjacent digit-run's words are covered - never the rest of the line -
-    so a label sharing a physical line with unrelated content (an email
-    address, a website, another column) is not swept in.
+    mobile number) within WORD_GAP words - AND for every further number
+    chained to it ("Tel: 0471 2436173, 2436175, 2436401"). Only the label's
+    words plus the digit runs' words are covered - never the rest of the
+    line - so a label sharing a physical line with unrelated content (an
+    email address, a website, another column) is not swept in.
 
     Returns:
       matches: list of (rect, description) for every label+number pair
@@ -209,7 +255,7 @@ def find_label_and_number_spans(line_words):
         if sum(ch.isdigit() for ch in m.group(0)) < 6:
             continue
         span = _char_span_to_word_span(m.start(), m.end(), offsets)
-        if span:
+        if span and span not in digit_spans:
             digit_spans.append(span)
 
     matches = []
@@ -228,57 +274,93 @@ def find_label_and_number_spans(line_words):
             if gap <= WORD_GAP and (best_gap is None or gap < best_gap):
                 best, best_gap = (dmin, dmax), gap
 
-        if best:
-            dmin, dmax = best
+        if not best:
+            continue
+        dmin, dmax = best
 
-            # Geometric gate: a small word-index gap isn't reliable on its
-            # own, since OCR (or a vector-outline/Illustrator-exported page)
-            # can merge visually separate rows into one logical "line". A
-            # label and a distant number can then be only a few word-indices
-            # apart even though they sit far apart on the page. Require them
-            # to also be physically close, or don't pair them - otherwise an
-            # unrelated number (e.g. a PIN code) can pull in a label from
-            # several rows away and the single resulting rectangle would
-            # bridge over real content (an email address, another column)
-            # sitting between them.
-            label_rects = [line_words[i][0] for i in range(lmin, lmax + 1)]
-            digit_rects = [line_words[i][0] for i in range(dmin, dmax + 1)]
-            label_box = _union_rect(label_rects)
-            digit_box = _union_rect(digit_rects)
-            heights = [r.height for r in label_rects + digit_rects if r.height > 0]
-            avg_h = sum(heights) / len(heights) if heights else 10
-            gap_x = max(0, max(label_box.x0, digit_box.x0) - min(label_box.x1, digit_box.x1))
-            gap_y = max(0, max(label_box.y0, digit_box.y0) - min(label_box.y1, digit_box.y1))
-            if gap_x > 8.0 * avg_h or gap_y > 3.0 * avg_h:
-                continue  # too far apart physically - don't pair
+        # Geometric gate: a small word-index gap isn't reliable on its
+        # own, since OCR (or a vector-outline/Illustrator-exported page)
+        # can merge visually separate rows into one logical "line". A
+        # label and a distant number can then be only a few word-indices
+        # apart even though they sit far apart on the page. Require them
+        # to also be physically close, or don't pair them - otherwise an
+        # unrelated number (e.g. a PIN code) can pull in a label from
+        # several rows away and the single resulting rectangle would
+        # bridge over real content (an email address, another column)
+        # sitting between them.
+        label_rects = [line_words[i][0] for i in range(lmin, lmax + 1)]
+        digit_rects = [line_words[i][0] for i in range(dmin, dmax + 1)]
+        label_box = _union_rect(label_rects)
+        digit_box = _union_rect(digit_rects)
+        heights = [r.height for r in label_rects + digit_rects if r.height > 0]
+        avg_h = sum(heights) / len(heights) if heights else 10
+        if not _boxes_close(label_box, digit_box, avg_h):
+            continue  # too far apart physically - don't pair
 
-            cmin, cmax = min(lmin, dmin), max(lmax, dmax)
-            # Cover the label's own words and the digit run's own words -
-            # never anything else that merely sits between them by index.
-            # A word strictly between the two spans is only pulled in if
-            # it's pure punctuation (":", ".", "-", "|", ...) with no
-            # letters or digits of its own, so a stray separator gets a
-            # tidy patch but any real content in between (an email
-            # address, a "Website:" label, ...) is left completely alone
-            # even if it happens to land close by in word order.
-            covered_idxs = set(range(lmin, lmax + 1)) | set(range(dmin, dmax + 1))
-            for i in range(cmin, cmax + 1):
-                if i in covered_idxs or i >= len(line_words):
+        # ---- FIX: follow the whole list of numbers ----------------------
+        # Previously only `best` was covered. Now keep adding every other
+        # digit run that is chained to the current group by nothing but
+        # separators / connector words and is physically close to it.
+        chain = [best]
+        grew = True
+        while grew:
+            grew = False
+            cmin = min(s[0] for s in chain)
+            cmax = max(s[1] for s in chain)
+            chain_box = _union_rect(
+                [line_words[i][0] for i in range(cmin, cmax + 1)]
+            )
+            for sp in digit_spans:
+                if sp in chain:
                     continue
-                text = line_words[i][2]
-                if text and not any(ch.isalnum() for ch in text):
-                    covered_idxs.add(i)
+                if sp[1] < cmin:
+                    between = range(sp[1] + 1, cmin)
+                elif sp[0] > cmax:
+                    between = range(cmax + 1, sp[0])
+                else:
+                    continue
+                if len(between) > WORD_GAP:
+                    continue
+                if not all(_is_list_connector(line_words[i][2]) for i in between):
+                    continue
+                sp_box = _union_rect(
+                    [line_words[i][0] for i in range(sp[0], sp[1] + 1)]
+                )
+                if not _boxes_close(chain_box, sp_box, avg_h):
+                    continue
+                chain.append(sp)
+                grew = True
+                break
 
-            # Patch each physically-contiguous run of covered words with its
-            # own tight rectangle, rather than one bounding box spanning
-            # from the label all the way to the number - a single box would
-            # also sweep in any unrelated content sitting visually between
-            # them (this was the bug that patched over the email address).
-            for run in _contiguous_runs(covered_idxs):
-                run_rects = [line_words[i][0] for i in run if i < len(line_words)]
-                if run_rects:
-                    matches.append((_union_rect(run_rects), "[labeled phone line]"))
-            used_label_spans.add((lmin, lmax))
+        # Cover the label's own words and every chained digit run's own
+        # words - never anything else that merely sits between them by
+        # index. A word strictly between two covered spans is only pulled
+        # in if it's pure punctuation (":", ".", "-", "|", ",", ...) with
+        # no letters or digits of its own, so a stray separator gets a tidy
+        # patch but any real content in between (an email address, a
+        # "Website:" label, ...) is left completely alone even if it
+        # happens to land close by in word order.
+        covered_idxs = set(range(lmin, lmax + 1))
+        for (a, b) in chain:
+            covered_idxs |= set(range(a, b + 1))
+        cmin, cmax = min(covered_idxs), max(covered_idxs)
+        for i in range(cmin, cmax + 1):
+            if i in covered_idxs or i >= len(line_words):
+                continue
+            text = line_words[i][2]
+            if text and not any(ch.isalnum() for ch in text):
+                covered_idxs.add(i)
+
+        # Patch each physically-contiguous run of covered words with its
+        # own tight rectangle, rather than one bounding box spanning
+        # from the label all the way to the number - a single box would
+        # also sweep in any unrelated content sitting visually between
+        # them (this was the bug that patched over the email address).
+        for run in _contiguous_runs(covered_idxs):
+            run_rects = [line_words[i][0] for i in run if i < len(line_words)]
+            if run_rects:
+                matches.append((_union_rect(run_rects), "[labeled phone line]"))
+        used_label_spans.add((lmin, lmax))
 
     orphan_label_spans = [s for s in label_spans if s not in used_label_spans]
     return matches, orphan_label_spans
@@ -400,15 +482,13 @@ def find_phone_matches(line_words):
         # A phone number can be visually spaced in brochure designs.
         # 6x character height is a safer upper bound while still avoiding
         # combining unrelated columns.
-        if len(rects) > 1:
-            for a, b in zip(rects, rects[1:]):
-                gap = b.x0 - a.x1
-                if gap > 6.0 * avg_height:
-                    break
-            else:
-                gap = None
-            if gap is not None and gap > 6.0 * avg_height:
-                continue
+        too_far = False
+        for a, b in zip(rects, rects[1:]):
+            if b.x0 - a.x1 > 6.0 * avg_height:
+                too_far = True
+                break
+        if too_far:
+            continue
 
         raw_rects = [line_words[wi][0] for wi in word_idxs]
         x0 = min(r.x0 for r in raw_rects)
@@ -451,6 +531,83 @@ def dedupe_by_overlap(matches):
     return deduped
 
 
+def extend_to_following_number_lines(page, page_matches, all_lines):
+    """Cover phone numbers stacked ONE PER LINE under a label or under
+    another phone number, e.g.
+
+        Contact Details
+        022 2345 6789
+        2436175
+        98765 43210
+
+    Per-line regexes can't link these (each line is its own "line"), so after
+    the normal detection we repeatedly look for a line that consists ONLY of
+    a phone-looking digit run, sits directly below / beside an
+    already-matched box, and is lined up with it. Repeats until nothing new
+    is added so a whole vertical list is followed.
+
+    Deliberately conservative to avoid eating prices / PIN codes:
+      * the line must contain nothing but digits and phone separators
+      * it must not look like Indian-grouped money ("1,25,00,000")
+      * >= 7 digits (>= 6 only when anchored to a labeled landline entry)
+      * <= 13 digits
+    """
+    if not page_matches:
+        return page_matches
+
+    rot = page.rotation_matrix
+
+    def to_disp(r):
+        d = r * rot
+        x0, x1 = sorted((d.x0, d.x1))
+        y0, y1 = sorted((d.y0, d.y1))
+        return fitz.Rect(x0, y0, x1, y1)
+
+    # Pre-compute candidate digit-only lines once.
+    candidates = []
+    for lw in all_lines:
+        text = " ".join(w[2] for w in lw).strip()
+        if not text or not _DIGIT_ONLY_LINE_RE.match(text):
+            continue
+        if re.search(r'\d,\d', text):
+            continue  # money-style grouping, not a phone number
+        n_digits = sum(ch.isdigit() for ch in text)
+        if n_digits < 6 or n_digits > 13:
+            continue
+        raw = _union_rect([w[0] for w in lw])
+        candidates.append((raw, to_disp(raw), text, n_digits))
+
+    matches = list(page_matches)
+    added = True
+    while added:
+        added = False
+        anchors = [(to_disp(r), m) for (r, m) in matches]
+        for (raw, disp, text, n_digits) in candidates:
+            # Already covered?
+            if any((disp & a).get_area() > 0.3 * max(1.0, disp.get_area())
+                   for a, _m in anchors):
+                continue
+            for a, anchor_text in anchors:
+                h = max(disp.height, a.height, 6.0)
+                # directly below (or just above) the anchor...
+                vertical_ok = (-0.5 * h <= disp.y0 - a.y1 <= 2.5 * h) or \
+                              (-0.5 * h <= a.y0 - disp.y1 <= 2.5 * h)
+                # ...and lined up with it (left edges close, or boxes overlap
+                # horizontally).
+                x_overlap = min(disp.x1, a.x1) - max(disp.x0, a.x0)
+                aligned = abs(disp.x0 - a.x0) <= 3.0 * h or x_overlap > 0
+                if not (vertical_ok and aligned):
+                    continue
+                min_digits = 6 if anchor_text == "[labeled phone line]" else 7
+                if n_digits < min_digits:
+                    continue
+                matches.append((raw, "[number list line] " + text))
+                added = True
+                break
+        # (loop again so a number under a newly-added number is found too)
+    return matches
+
+
 def sample_background_color(pix, raw_rect, page, zoom, pad=6, ring=10):
     """Sample the page background around (but outside) the match, in the
     pixmap's DISPLAY pixel space, to find a fill color that blends in.
@@ -469,10 +626,10 @@ def sample_background_color(pix, raw_rect, page, zoom, pad=6, ring=10):
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(H, W, pix.n)[:, :, :3]
 
     outer_pad = int(pad * zoom) + ring
-    top_y = max(py0 - outer_pad, 0)
-    bottom_y = min(py1 + outer_pad, H - 1)
-    left_x = max(px0 - outer_pad, 0)
-    right_x = min(px1 + outer_pad, W - 1)
+    top_y = min(max(py0 - outer_pad, 0), H - 1)
+    bottom_y = min(max(py1 + outer_pad, 0), H - 1)
+    left_x = min(max(px0 - outer_pad, 0), W - 1)
+    right_x = min(max(px1 + outer_pad, 0), W - 1)
     xs = np.arange(max(px0 - outer_pad, 0), min(px1 + outer_pad, W), 4)
     ys = np.arange(max(py0 - outer_pad, 0), min(py1 + outer_pad, H), 4)
 
@@ -741,16 +898,18 @@ def _redact_document(doc, pad=4.0, zoom=2):
         page_matches = []       # (rect, description) - actual phone numbers
         heading_candidates = [] # (rect, description) - bare "Ph:"-style headings
 
-        for lw in group_lines(text_words) + group_lines(ocr_words):
+        all_lines = group_lines(text_words) + group_lines(ocr_words)
+
+        for lw in all_lines:
             # Mobile numbers, wherever they sit on the line.
             for rect, matched_text, _span in find_phone_matches(lw):
                 page_matches.append((rect, matched_text))
 
             # Any phone-related label (Tel, Contact Details, Call For
             # Enquiry, ...) paired with a nearby digit run on the SAME
-            # line - covers the label AND the number together, and nothing
-            # else on that line (so an email/website sharing the row is
-            # left untouched).
+            # line - covers the label AND every number of the list that
+            # follows it, and nothing else on that line (so an
+            # email/website sharing the row is left untouched).
             label_number_matches, orphan_label_spans = find_label_and_number_spans(lw)
             page_matches.extend(label_number_matches)
 
@@ -770,12 +929,17 @@ def _redact_document(doc, pad=4.0, zoom=2):
         page_matches = dedupe_by_overlap(page_matches)
         heading_candidates = dedupe_by_overlap(heading_candidates)
 
+        # Numbers stacked one per line under a label / another number.
+        page_matches = extend_to_following_number_lines(page, page_matches, all_lines)
+        page_matches = dedupe_by_overlap(page_matches)
+
         # Only strip standalone phone headings (e.g. a lone "Ph:" line, or a
         # "Contact Details"/"Contact Information" heading) when the page
         # actually had a phone number redacted somewhere - a heading word
         # showing up with no nearby number is left alone.
         if page_matches and heading_candidates:
             page_matches.extend(heading_candidates)
+            page_matches = dedupe_by_overlap(page_matches)
 
         if not page_matches:
             continue
